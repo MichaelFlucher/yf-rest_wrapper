@@ -163,46 +163,73 @@ def get_holdings(ticker):
         if quote_type not in ['ETF', 'MUTUALFUND']:
             return jsonify({"error": f"Not an ETF or Fund (quoteType: {quote_type})"}), 400
 
-        # Get funds data
-        funds_data = ticker_obj.funds_data
-
         result = {
             "topHoldings": [],
             "sectorWeights": [],
-            "fetchedAt": datetime.now().isoformat()
+            "fetchedAt": datetime.now().isoformat(),
+            "debug": {}
         }
 
-        # Get top holdings
+        # Get funds data - may not be available for all ETFs
         try:
-            top_holdings = funds_data.top_holdings
-            if top_holdings is not None and not top_holdings.empty:
-                for idx, row in top_holdings.iterrows():
-                    holding = {
-                        "symbol": str(idx) if idx else "",
-                        "holdingName": row.get('Name', row.get('holdingName', '')),
-                        "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
-                    }
-                    result["topHoldings"].append(holding)
+            funds_data = ticker_obj.funds_data
+            result["debug"]["hasFundsData"] = funds_data is not None
         except Exception as e:
-            print(f"Error getting top holdings: {e}")
+            result["debug"]["fundsDataError"] = str(e)
+            # Try alternative: check if info has sector/holdings data
+            funds_data = None
 
-        # Get sector weights
-        try:
-            sector_weights = funds_data.sector_weightings
-            if sector_weights:
-                for sector_dict in sector_weights:
-                    for sector, weight in sector_dict.items():
-                        result["sectorWeights"].append({
-                            "sector": sector,
-                            "weight": float(weight) * 100
-                        })
-        except Exception as e:
-            print(f"Error getting sector weights: {e}")
+        # Get top holdings
+        if funds_data:
+            try:
+                top_holdings = funds_data.top_holdings
+                result["debug"]["topHoldingsType"] = str(type(top_holdings))
+                if top_holdings is not None and hasattr(top_holdings, 'empty') and not top_holdings.empty:
+                    for idx, row in top_holdings.iterrows():
+                        holding = {
+                            "symbol": str(idx) if idx else "",
+                            "holdingName": row.get('Name', row.get('holdingName', '')),
+                            "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
+                        }
+                        result["topHoldings"].append(holding)
+                elif top_holdings is not None:
+                    result["debug"]["topHoldingsEmpty"] = True
+            except Exception as e:
+                result["debug"]["topHoldingsError"] = str(e)
+
+            # Get sector weights
+            try:
+                sector_weights = funds_data.sector_weightings
+                result["debug"]["sectorWeightsType"] = str(type(sector_weights))
+                result["debug"]["sectorWeightsRaw"] = str(sector_weights)[:500] if sector_weights else None
+                if sector_weights:
+                    # Handle different possible formats
+                    if isinstance(sector_weights, list):
+                        for item in sector_weights:
+                            if isinstance(item, dict):
+                                for sector, weight in item.items():
+                                    result["sectorWeights"].append({
+                                        "sector": sector,
+                                        "weight": float(weight) * 100
+                                    })
+                    elif isinstance(sector_weights, dict):
+                        for sector, weight in sector_weights.items():
+                            result["sectorWeights"].append({
+                                "sector": sector,
+                                "weight": float(weight) * 100
+                            })
+            except Exception as e:
+                result["debug"]["sectorWeightsError"] = str(e)
 
         # Return error if no data available
         if not result["topHoldings"] and not result["sectorWeights"]:
-            return jsonify({"error": "No holdings data available"}), 404
+            return jsonify({
+                "error": "No holdings data available",
+                "debug": result["debug"]
+            }), 404
 
+        # Remove debug in production (or keep for troubleshooting)
+        # del result["debug"]
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -148,11 +148,34 @@ def get_recommendations(ticker):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def fetch_holdings_from_yahoo_api(ticker):
+    """
+    Fetch ETF holdings directly from Yahoo Finance quoteSummary API.
+    This works for more ETFs than yfinance's funds_data property.
+    """
+    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+    params = {
+        'modules': 'topHoldings,assetProfile'
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json'
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    if not response.ok:
+        return None
+
+    data = response.json()
+    return data.get('quoteSummary', {}).get('result', [{}])[0]
+
+
 @app.route('/stock/<ticker>/holdings', methods=['GET'])
 def get_holdings(ticker):
     """
     Get ETF holdings and sector weights.
     Returns top holdings and sector breakdown for ETFs/Funds.
+    Uses Yahoo Finance quoteSummary API directly for better coverage.
     """
     try:
         ticker_obj = yf.Ticker(ticker)
@@ -166,70 +189,79 @@ def get_holdings(ticker):
         result = {
             "topHoldings": [],
             "sectorWeights": [],
-            "fetchedAt": datetime.now().isoformat(),
-            "debug": {}
+            "fetchedAt": datetime.now().isoformat()
         }
 
-        # Get funds data - may not be available for all ETFs
-        try:
-            funds_data = ticker_obj.funds_data
-            result["debug"]["hasFundsData"] = funds_data is not None
-        except Exception as e:
-            result["debug"]["fundsDataError"] = str(e)
-            # Try alternative: check if info has sector/holdings data
-            funds_data = None
+        # Try Yahoo Finance quoteSummary API directly (better coverage)
+        yahoo_data = fetch_holdings_from_yahoo_api(ticker)
 
-        # Get top holdings
-        if funds_data:
-            try:
-                top_holdings = funds_data.top_holdings
-                result["debug"]["topHoldingsType"] = str(type(top_holdings))
-                if top_holdings is not None and hasattr(top_holdings, 'empty') and not top_holdings.empty:
-                    for idx, row in top_holdings.iterrows():
-                        holding = {
-                            "symbol": str(idx) if idx else "",
-                            "holdingName": row.get('Name', row.get('holdingName', '')),
-                            "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
-                        }
-                        result["topHoldings"].append(holding)
-                elif top_holdings is not None:
-                    result["debug"]["topHoldingsEmpty"] = True
-            except Exception as e:
-                result["debug"]["topHoldingsError"] = str(e)
+        if yahoo_data and 'topHoldings' in yahoo_data:
+            top_holdings_data = yahoo_data['topHoldings']
 
-            # Get sector weights
+            # Get holdings
+            holdings = top_holdings_data.get('holdings', [])
+            for holding in holdings:
+                result["topHoldings"].append({
+                    "symbol": holding.get('symbol', ''),
+                    "holdingName": holding.get('holdingName', ''),
+                    "holdingPercent": holding.get('holdingPercent', {}).get('raw', 0) * 100
+                })
+
+            # Get sector weightings
+            sector_weights = top_holdings_data.get('sectorWeightings', [])
+            for sector_dict in sector_weights:
+                for sector, weight_data in sector_dict.items():
+                    weight = weight_data.get('raw', 0) if isinstance(weight_data, dict) else weight_data
+                    result["sectorWeights"].append({
+                        "sector": sector,
+                        "weight": float(weight) * 100
+                    })
+
+        # Fallback to yfinance funds_data if Yahoo API didn't return data
+        if not result["topHoldings"] and not result["sectorWeights"]:
             try:
-                sector_weights = funds_data.sector_weightings
-                result["debug"]["sectorWeightsType"] = str(type(sector_weights))
-                result["debug"]["sectorWeightsRaw"] = str(sector_weights)[:500] if sector_weights else None
-                if sector_weights:
-                    # Handle different possible formats
-                    if isinstance(sector_weights, list):
-                        for item in sector_weights:
-                            if isinstance(item, dict):
-                                for sector, weight in item.items():
+                funds_data = ticker_obj.funds_data
+                if funds_data:
+                    # Get top holdings from yfinance
+                    try:
+                        top_holdings = funds_data.top_holdings
+                        if top_holdings is not None and hasattr(top_holdings, 'empty') and not top_holdings.empty:
+                            for idx, row in top_holdings.iterrows():
+                                result["topHoldings"].append({
+                                    "symbol": str(idx) if idx else "",
+                                    "holdingName": row.get('Name', row.get('holdingName', '')),
+                                    "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
+                                })
+                    except Exception:
+                        pass
+
+                    # Get sector weights from yfinance
+                    try:
+                        sector_weights = funds_data.sector_weightings
+                        if sector_weights:
+                            if isinstance(sector_weights, list):
+                                for item in sector_weights:
+                                    if isinstance(item, dict):
+                                        for sector, weight in item.items():
+                                            result["sectorWeights"].append({
+                                                "sector": sector,
+                                                "weight": float(weight) * 100
+                                            })
+                            elif isinstance(sector_weights, dict):
+                                for sector, weight in sector_weights.items():
                                     result["sectorWeights"].append({
                                         "sector": sector,
                                         "weight": float(weight) * 100
                                     })
-                    elif isinstance(sector_weights, dict):
-                        for sector, weight in sector_weights.items():
-                            result["sectorWeights"].append({
-                                "sector": sector,
-                                "weight": float(weight) * 100
-                            })
-            except Exception as e:
-                result["debug"]["sectorWeightsError"] = str(e)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         # Return error if no data available
         if not result["topHoldings"] and not result["sectorWeights"]:
-            return jsonify({
-                "error": "No holdings data available",
-                "debug": result["debug"]
-            }), 404
+            return jsonify({"error": "No holdings data available"}), 404
 
-        # Remove debug in production (or keep for troubleshooting)
-        # del result["debug"]
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

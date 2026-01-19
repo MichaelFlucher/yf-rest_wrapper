@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import requests
 
 app = Flask(__name__)
 
@@ -17,6 +18,49 @@ def clean_json(df):
     df = df.dropna(how='any')
     # Reset index and return a list of records
     return df.reset_index().to_dict(orient='records')
+
+# Route for searching symbols by ISIN or query
+@app.route('/search', methods=['GET'])
+def search_symbol():
+    try:
+        query = request.args.get('q')
+        region = request.args.get('region', 'US')
+
+        if not query:
+            return jsonify({"error": "Missing query parameter 'q'"}), 400
+
+        # Build Yahoo Finance search URL
+        yahoo_url = f"https://query2.finance.yahoo.com/v1/finance/search"
+        params = {
+            'q': query,
+            'quotesCount': 10,
+            'newsCount': 0,
+            'enableFuzzyQuery': False,
+            'quotesQueryId': 'tss_match_phrase_query',
+            'region': region
+        }
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+
+        response = requests.get(yahoo_url, params=params, headers=headers, timeout=10)
+
+        if not response.ok:
+            return jsonify({
+                "error": f"Yahoo Finance returned {response.status_code}",
+                "details": response.text[:200]
+            }), response.status_code
+
+        return jsonify(response.json()), 200
+
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Request to Yahoo Finance timed out"}), 504
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Request failed: {str(e)}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Route for ticker basic info
 @app.route('/stock/<ticker>', methods=['GET'])

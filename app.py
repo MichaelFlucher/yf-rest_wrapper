@@ -148,6 +148,65 @@ def get_recommendations(ticker):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/stock/<ticker>/holdings', methods=['GET'])
+def get_holdings(ticker):
+    """
+    Get ETF holdings and sector weights.
+    Returns top holdings and sector breakdown for ETFs/Funds.
+    """
+    try:
+        ticker_obj = yf.Ticker(ticker)
+
+        # Check if this is an ETF/Fund
+        info = ticker_obj.info
+        quote_type = info.get('quoteType', '')
+        if quote_type not in ['ETF', 'MUTUALFUND']:
+            return jsonify({"error": f"Not an ETF or Fund (quoteType: {quote_type})"}), 400
+
+        # Get funds data
+        funds_data = ticker_obj.funds_data
+
+        result = {
+            "topHoldings": [],
+            "sectorWeights": [],
+            "fetchedAt": datetime.now().isoformat()
+        }
+
+        # Get top holdings
+        try:
+            top_holdings = funds_data.top_holdings
+            if top_holdings is not None and not top_holdings.empty:
+                for idx, row in top_holdings.iterrows():
+                    holding = {
+                        "symbol": str(idx) if idx else "",
+                        "holdingName": row.get('Name', row.get('holdingName', '')),
+                        "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
+                    }
+                    result["topHoldings"].append(holding)
+        except Exception as e:
+            print(f"Error getting top holdings: {e}")
+
+        # Get sector weights
+        try:
+            sector_weights = funds_data.sector_weightings
+            if sector_weights:
+                for sector_dict in sector_weights:
+                    for sector, weight in sector_dict.items():
+                        result["sectorWeights"].append({
+                            "sector": sector,
+                            "weight": float(weight) * 100
+                        })
+        except Exception as e:
+            print(f"Error getting sector weights: {e}")
+
+        # Return error if no data available
+        if not result["topHoldings"] and not result["sectorWeights"]:
+            return jsonify({"error": "No holdings data available"}), 404
+
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/stocks/close_prices', methods=['POST'])
 def get_close_prices():
     try:

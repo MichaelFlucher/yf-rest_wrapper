@@ -300,6 +300,7 @@ def fetch_holdings_from_fmp(ticker):
     """
     Fetch ETF holdings from Financial Modeling Prep API as a fallback.
     Requires FMP_API_KEY environment variable.
+    Uses the stable API endpoints (v3 legacy endpoints deprecated Aug 2025).
     """
     logger.info(f"[{ticker}] Fetching from Financial Modeling Prep API...")
 
@@ -316,23 +317,27 @@ def fetch_holdings_from_fmp(ticker):
         "sectorWeights": []
     }
 
-    # Try to get ETF holdings
+    # Try to get ETF holdings (stable API)
     try:
-        holdings_url = f"https://financialmodelingprep.com/api/v3/etf-holder/{base_ticker}?apikey={FMP_API_KEY}"
+        holdings_url = f"https://financialmodelingprep.com/stable/etf/holdings?symbol={base_ticker}&apikey={FMP_API_KEY}"
         response = requests.get(holdings_url, timeout=10)
         logger.info(f"[{ticker}] FMP holdings API: Status {response.status_code}")
         if response.ok:
             holdings_data = response.json()
             if isinstance(holdings_data, list) and len(holdings_data) > 0:
                 logger.info(f"[{ticker}] FMP API: Found {len(holdings_data)} holdings")
+                # Log first holding structure for debugging
+                if holdings_data:
+                    logger.info(f"[{ticker}] FMP API: Sample holding keys: {list(holdings_data[0].keys())}")
                 for holding in holdings_data[:20]:
-                    weight = holding.get('weightPercentage', '')
+                    # Handle both old and new field names
+                    weight = holding.get('weightPercentage', holding.get('weight', ''))
                     if isinstance(weight, str):
                         weight = float(weight.replace('%', '')) if weight else 0
                     else:
                         weight = float(weight) if weight else 0
                     result["topHoldings"].append({
-                        "symbol": holding.get('asset', ''),
+                        "symbol": holding.get('asset', holding.get('symbol', '')),
                         "holdingName": holding.get('name', ''),
                         "holdingPercent": weight
                     })
@@ -343,17 +348,20 @@ def fetch_holdings_from_fmp(ticker):
     except Exception as e:
         logger.error(f"[{ticker}] FMP holdings API error: {e}")
 
-    # Try to get sector weightings
+    # Try to get sector weightings (stable API)
     try:
-        sector_url = f"https://financialmodelingprep.com/api/v3/etf-sector-weightings/{base_ticker}?apikey={FMP_API_KEY}"
+        sector_url = f"https://financialmodelingprep.com/stable/etf/sector-weightings?symbol={base_ticker}&apikey={FMP_API_KEY}"
         response = requests.get(sector_url, timeout=10)
         logger.info(f"[{ticker}] FMP sector API: Status {response.status_code}")
         if response.ok:
             sector_data = response.json()
             if isinstance(sector_data, list) and len(sector_data) > 0:
+                # Log first sector structure for debugging
+                if sector_data:
+                    logger.info(f"[{ticker}] FMP API: Sample sector keys: {list(sector_data[0].keys())}")
                 sectors_found = 0
                 for sector_item in sector_data:
-                    weight = sector_item.get('weightPercentage', '')
+                    weight = sector_item.get('weightPercentage', sector_item.get('weight', ''))
                     if isinstance(weight, str):
                         weight = float(weight.replace('%', '')) if weight else 0
                     else:

@@ -4,8 +4,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import requests
+import os
 
 app = Flask(__name__)
+
+# Tiingo API key from environment
+TIINGO_API_KEY = os.environ.get('TIINGO_API_KEY')
 
 pd.options.mode.use_inf_as_na = True
 
@@ -170,6 +174,83 @@ def fetch_holdings_from_yahoo_api(ticker):
     return data.get('quoteSummary', {}).get('result', [{}])[0]
 
 
+def fetch_holdings_from_tiingo(ticker):
+    """
+    Fetch ETF holdings from Tiingo API as a fallback.
+    Requires TIINGO_API_KEY environment variable.
+    """
+    if not TIINGO_API_KEY:
+        return None
+
+    # Strip exchange suffix for Tiingo (e.g., CNYAN.MX -> CNYAN)
+    base_ticker = ticker.split('.')[0]
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Token {TIINGO_API_KEY}'
+    }
+
+    result = {
+        "topHoldings": [],
+        "sectorWeights": []
+    }
+
+    # Try to get holdings
+    try:
+        holdings_url = f"https://api.tiingo.com/tiingo/funds/{base_ticker}/holdings"
+        response = requests.get(holdings_url, headers=headers, timeout=10)
+        if response.ok:
+            holdings_data = response.json()
+            if isinstance(holdings_data, list) and len(holdings_data) > 0:
+                # Get the most recent holdings
+                latest = holdings_data[0] if holdings_data else {}
+                holdings = latest.get('holdings', [])
+                for holding in holdings[:20]:  # Top 20 holdings
+                    result["topHoldings"].append({
+                        "symbol": holding.get('ticker', ''),
+                        "holdingName": holding.get('name', ''),
+                        "holdingPercent": float(holding.get('weight', 0)) * 100
+                    })
+    except Exception as e:
+        print(f"Tiingo holdings error: {e}")
+
+    # Try to get sector/exposure data
+    try:
+        exposure_url = f"https://api.tiingo.com/tiingo/funds/{base_ticker}/metrics"
+        response = requests.get(exposure_url, headers=headers, timeout=10)
+        if response.ok:
+            metrics_data = response.json()
+            if isinstance(metrics_data, list) and len(metrics_data) > 0:
+                latest = metrics_data[0] if metrics_data else {}
+                # Tiingo provides sector exposure in metrics
+                sector_fields = [
+                    ('basicMaterials', 'Basic Materials'),
+                    ('communicationServices', 'Communication Services'),
+                    ('consumerCyclical', 'Consumer Cyclical'),
+                    ('consumerDefensive', 'Consumer Defensive'),
+                    ('energy', 'Energy'),
+                    ('financialServices', 'Financial Services'),
+                    ('healthcare', 'Healthcare'),
+                    ('industrials', 'Industrials'),
+                    ('realEstate', 'Real Estate'),
+                    ('technology', 'Technology'),
+                    ('utilities', 'Utilities'),
+                ]
+                for field, display_name in sector_fields:
+                    weight = latest.get(field)
+                    if weight and float(weight) > 0:
+                        result["sectorWeights"].append({
+                            "sector": display_name,
+                            "weight": float(weight) * 100
+                        })
+    except Exception as e:
+        print(f"Tiingo metrics error: {e}")
+
+    if result["topHoldings"] or result["sectorWeights"]:
+        return result
+    return None
+
+
 @app.route('/stock/<ticker>/holdings', methods=['GET'])
 def get_holdings(ticker):
     """
@@ -258,7 +339,15 @@ def get_holdings(ticker):
             except Exception:
                 pass
 
-        # Return error if no data available
+        # Fallback to Tiingo API if still no data
+        if not result["topHoldings"] and not result["sectorWeights"]:
+            tiingo_data = fetch_holdings_from_tiingo(ticker)
+            if tiingo_data:
+                result["topHoldings"] = tiingo_data.get("topHoldings", [])
+                result["sectorWeights"] = tiingo_data.get("sectorWeights", [])
+                result["source"] = "tiingo"
+
+        # Return error if no data available from any source
         if not result["topHoldings"] and not result["sectorWeights"]:
             return jsonify({"error": "No holdings data available"}), 404
 

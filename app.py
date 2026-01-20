@@ -163,6 +163,82 @@ def get_recommendations(ticker):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def find_alternative_ticker_by_isin(isin, original_ticker):
+    """
+    Search for alternative tickers using ISIN.
+    Returns a US-listed ticker if available, or None.
+    Prioritizes US exchanges for better data coverage.
+    """
+    if not isin:
+        return None
+
+    logger.info(f"[{original_ticker}] Searching for alternative tickers with ISIN: {isin}")
+
+    try:
+        yahoo_url = "https://query2.finance.yahoo.com/v1/finance/search"
+        params = {
+            'q': isin,
+            'quotesCount': 10,
+            'newsCount': 0,
+            'enableFuzzyQuery': False,
+            'quotesQueryId': 'tss_match_phrase_query'
+        }
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+
+        response = requests.get(yahoo_url, params=params, headers=headers, timeout=10)
+        if not response.ok:
+            logger.warning(f"[{original_ticker}] ISIN search failed: {response.status_code}")
+            return None
+
+        data = response.json()
+        quotes = data.get('quotes', [])
+
+        if not quotes:
+            logger.info(f"[{original_ticker}] No alternative tickers found for ISIN {isin}")
+            return None
+
+        logger.info(f"[{original_ticker}] Found {len(quotes)} tickers for ISIN {isin}")
+
+        # Prioritize exchanges: US first, then major exchanges
+        priority_exchanges = ['NYQ', 'NMS', 'NGM', 'PCX', 'BTS', 'LSE', 'GER', 'PAR']
+
+        for exchange in priority_exchanges:
+            for quote in quotes:
+                symbol = quote.get('symbol', '')
+                quote_exchange = quote.get('exchange', '')
+                quote_type = quote.get('quoteType', '')
+
+                # Skip if it's the same ticker we started with
+                if symbol == original_ticker:
+                    continue
+
+                # Only consider ETFs
+                if quote_type not in ['ETF', 'MUTUALFUND']:
+                    continue
+
+                if quote_exchange == exchange:
+                    logger.info(f"[{original_ticker}] Found alternative: {symbol} on {quote_exchange}")
+                    return symbol
+
+        # If no priority exchange found, return first ETF that's not the original
+        for quote in quotes:
+            symbol = quote.get('symbol', '')
+            quote_type = quote.get('quoteType', '')
+            if symbol != original_ticker and quote_type in ['ETF', 'MUTUALFUND']:
+                logger.info(f"[{original_ticker}] Using alternative: {symbol} on {quote.get('exchange', 'unknown')}")
+                return symbol
+
+        logger.info(f"[{original_ticker}] No suitable alternative ticker found")
+        return None
+
+    except Exception as e:
+        logger.error(f"[{original_ticker}] ISIN search error: {e}")
+        return None
+
+
 def fetch_holdings_from_yahoo_api(ticker):
     """
     Fetch ETF holdings directly from Yahoo Finance quoteSummary API.
@@ -517,6 +593,86 @@ def get_holdings(ticker):
                 result["sectorWeights"] = fmp_data.get("sectorWeights", [])
                 result["source"] = "fmp"
                 logger.info(f"[{ticker}] SUCCESS via FMP API")
+
+        # ISIN Fallback: Try to find an alternative ticker (e.g., US-listed version)
+        if not result["topHoldings"] and not result["sectorWeights"]:
+            isin = info.get('isin')
+            if isin:
+                alt_ticker = find_alternative_ticker_by_isin(isin, ticker)
+                if alt_ticker:
+                    logger.info(f"[{ticker}] Trying alternative ticker: {alt_ticker}")
+
+                    # Try Yahoo Finance with alternative ticker
+                    alt_yahoo_data = fetch_holdings_from_yahoo_api(alt_ticker)
+                    if alt_yahoo_data and 'topHoldings' in alt_yahoo_data:
+                        top_holdings_data = alt_yahoo_data['topHoldings']
+                        holdings = top_holdings_data.get('holdings', [])
+                        for holding in holdings:
+                            result["topHoldings"].append({
+                                "symbol": holding.get('symbol', ''),
+                                "holdingName": holding.get('holdingName', ''),
+                                "holdingPercent": holding.get('holdingPercent', {}).get('raw', 0) * 100
+                            })
+                        sector_weights = top_holdings_data.get('sectorWeightings', [])
+                        for sector_dict in sector_weights:
+                            for sector, weight_data in sector_dict.items():
+                                weight = weight_data.get('raw', 0) if isinstance(weight_data, dict) else weight_data
+                                result["sectorWeights"].append({
+                                    "sector": sector,
+                                    "weight": float(weight) * 100
+                                })
+                        if result["topHoldings"] or result["sectorWeights"]:
+                            result["source"] = f"yahoo (via {alt_ticker})"
+                            result["alternativeTicker"] = alt_ticker
+                            logger.info(f"[{ticker}] SUCCESS via Yahoo Finance using {alt_ticker}")
+
+                    # Try yfinance with alternative ticker if Yahoo didn't work
+                    if not result["topHoldings"] and not result["sectorWeights"]:
+                        try:
+                            alt_ticker_obj = yf.Ticker(alt_ticker)
+                            alt_funds_data = alt_ticker_obj.funds_data
+                            if alt_funds_data:
+                                try:
+                                    top_holdings = alt_funds_data.top_holdings
+                                    if top_holdings is not None and hasattr(top_holdings, 'empty') and not top_holdings.empty:
+                                        logger.info(f"[{ticker}] yfinance ({alt_ticker}): Found {len(top_holdings)} holdings")
+                                        for idx, row in top_holdings.iterrows():
+                                            result["topHoldings"].append({
+                                                "symbol": str(idx) if idx else "",
+                                                "holdingName": row.get('Name', row.get('holdingName', '')),
+                                                "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
+                                            })
+                                except Exception as e:
+                                    logger.error(f"[{ticker}] yfinance ({alt_ticker}) holdings error: {e}")
+
+                                try:
+                                    sector_weights = alt_funds_data.sector_weightings
+                                    if sector_weights:
+                                        if isinstance(sector_weights, list):
+                                            for item in sector_weights:
+                                                if isinstance(item, dict):
+                                                    for sector, weight in item.items():
+                                                        result["sectorWeights"].append({
+                                                            "sector": sector,
+                                                            "weight": float(weight) * 100
+                                                        })
+                                        elif isinstance(sector_weights, dict):
+                                            for sector, weight in sector_weights.items():
+                                                result["sectorWeights"].append({
+                                                    "sector": sector,
+                                                    "weight": float(weight) * 100
+                                                })
+                                except Exception as e:
+                                    logger.error(f"[{ticker}] yfinance ({alt_ticker}) sector error: {e}")
+
+                                if result["topHoldings"] or result["sectorWeights"]:
+                                    result["source"] = f"yfinance (via {alt_ticker})"
+                                    result["alternativeTicker"] = alt_ticker
+                                    logger.info(f"[{ticker}] SUCCESS via yfinance using {alt_ticker}")
+                        except Exception as e:
+                            logger.error(f"[{ticker}] yfinance ({alt_ticker}) error: {e}")
+            else:
+                logger.info(f"[{ticker}] No ISIN available for alternative ticker lookup")
 
         # Return error if no data available from any source
         if not result["topHoldings"] and not result["sectorWeights"]:

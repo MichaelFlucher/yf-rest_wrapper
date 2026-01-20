@@ -470,9 +470,17 @@ def get_holdings(ticker):
     Get ETF holdings and sector weights.
     Returns top holdings and sector breakdown for ETFs/Funds.
     Uses Yahoo Finance quoteSummary API directly for better coverage.
+
+    Optional query param:
+        isin: If provided, skips ISIN lookup for alternative ticker fallback
     """
+    # Get optional ISIN from query params (avoids lookup if provided by caller)
+    provided_isin = request.args.get('isin')
+
     logger.info(f"{'='*60}")
     logger.info(f"[{ticker}] Starting holdings lookup...")
+    if provided_isin:
+        logger.info(f"[{ticker}] ISIN provided by caller: {provided_isin}")
     logger.info(f"{'='*60}")
 
     try:
@@ -596,7 +604,8 @@ def get_holdings(ticker):
 
         # ISIN Fallback: Try to find an alternative ticker (e.g., US-listed version)
         if not result["topHoldings"] and not result["sectorWeights"]:
-            isin = info.get('isin')
+            # Use provided ISIN if available, otherwise try to get from ticker info
+            isin = provided_isin or info.get('isin')
             if isin:
                 alt_ticker = find_alternative_ticker_by_isin(isin, ticker)
                 if alt_ticker:

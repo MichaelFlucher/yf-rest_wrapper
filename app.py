@@ -5,6 +5,16 @@ import numpy as np
 from datetime import datetime, timedelta
 import requests
 import os
+import logging
+import sys
+
+# Configure logging to flush immediately and show in Docker logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -158,7 +168,7 @@ def fetch_holdings_from_yahoo_api(ticker):
     Fetch ETF holdings directly from Yahoo Finance quoteSummary API.
     This works for more ETFs than yfinance's funds_data property.
     """
-    print(f"[{ticker}] Fetching from Yahoo Finance quoteSummary API...")
+    logger.info(f"[{ticker}] Fetching from Yahoo Finance quoteSummary API...")
     url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
     params = {
         'modules': 'topHoldings,assetProfile'
@@ -171,7 +181,7 @@ def fetch_holdings_from_yahoo_api(ticker):
     try:
         response = requests.get(url, params=params, headers=headers, timeout=10)
         if not response.ok:
-            print(f"[{ticker}] Yahoo Finance API returned status {response.status_code}")
+            logger.warning(f"[{ticker}] Yahoo Finance API returned status {response.status_code}")
             return None
 
         data = response.json()
@@ -180,13 +190,13 @@ def fetch_holdings_from_yahoo_api(ticker):
         if result and 'topHoldings' in result:
             holdings_count = len(result['topHoldings'].get('holdings', []))
             sectors_count = len(result['topHoldings'].get('sectorWeightings', []))
-            print(f"[{ticker}] Yahoo Finance API: Found {holdings_count} holdings, {sectors_count} sector weightings")
+            logger.info(f"[{ticker}] Yahoo Finance API: Found {holdings_count} holdings, {sectors_count} sector weightings")
             return result
         else:
-            print(f"[{ticker}] Yahoo Finance API: No topHoldings data in response")
+            logger.info(f"[{ticker}] Yahoo Finance API: No topHoldings data in response")
             return None
     except Exception as e:
-        print(f"[{ticker}] Yahoo Finance API error: {e}")
+        logger.error(f"[{ticker}] Yahoo Finance API error: {e}")
         return None
 
 
@@ -195,15 +205,15 @@ def fetch_holdings_from_tiingo(ticker):
     Fetch ETF holdings from Tiingo API as a fallback.
     Requires TIINGO_API_KEY environment variable.
     """
-    print(f"[{ticker}] Fetching from Tiingo API...")
+    logger.info(f"[{ticker}] Fetching from Tiingo API...")
 
     if not TIINGO_API_KEY:
-        print(f"[{ticker}] Tiingo API: No API key configured (TIINGO_API_KEY not set)")
+        logger.warning(f"[{ticker}] Tiingo API: No API key configured (TIINGO_API_KEY not set)")
         return None
 
     # Strip exchange suffix for Tiingo (e.g., CNYAN.MX -> CNYAN)
     base_ticker = ticker.split('.')[0]
-    print(f"[{ticker}] Tiingo API: Using base ticker '{base_ticker}'")
+    logger.info(f"[{ticker}] Tiingo API: Using base ticker '{base_ticker}'")
 
     headers = {
         'Content-Type': 'application/json',
@@ -219,13 +229,13 @@ def fetch_holdings_from_tiingo(ticker):
     try:
         holdings_url = f"https://api.tiingo.com/tiingo/funds/{base_ticker}/holdings"
         response = requests.get(holdings_url, headers=headers, timeout=10)
-        print(f"[{ticker}] Tiingo holdings API: Status {response.status_code}")
+        logger.info(f"[{ticker}] Tiingo holdings API: Status {response.status_code}")
         if response.ok:
             holdings_data = response.json()
             if isinstance(holdings_data, list) and len(holdings_data) > 0:
                 latest = holdings_data[0] if holdings_data else {}
                 holdings = latest.get('holdings', [])
-                print(f"[{ticker}] Tiingo API: Found {len(holdings)} holdings")
+                logger.info(f"[{ticker}] Tiingo API: Found {len(holdings)} holdings")
                 for holding in holdings[:20]:
                     result["topHoldings"].append({
                         "symbol": holding.get('ticker', ''),
@@ -233,17 +243,17 @@ def fetch_holdings_from_tiingo(ticker):
                         "holdingPercent": float(holding.get('weight', 0)) * 100
                     })
             else:
-                print(f"[{ticker}] Tiingo API: Empty or invalid holdings response")
+                logger.info(f"[{ticker}] Tiingo API: Empty or invalid holdings response")
         else:
-            print(f"[{ticker}] Tiingo holdings API: Failed - {response.text[:200]}")
+            logger.warning(f"[{ticker}] Tiingo holdings API: Failed - {response.text[:200]}")
     except Exception as e:
-        print(f"[{ticker}] Tiingo holdings API error: {e}")
+        logger.error(f"[{ticker}] Tiingo holdings API error: {e}")
 
     # Try to get sector/exposure data
     try:
         exposure_url = f"https://api.tiingo.com/tiingo/funds/{base_ticker}/metrics"
         response = requests.get(exposure_url, headers=headers, timeout=10)
-        print(f"[{ticker}] Tiingo metrics API: Status {response.status_code}")
+        logger.info(f"[{ticker}] Tiingo metrics API: Status {response.status_code}")
         if response.ok:
             metrics_data = response.json()
             if isinstance(metrics_data, list) and len(metrics_data) > 0:
@@ -270,19 +280,19 @@ def fetch_holdings_from_tiingo(ticker):
                             "weight": float(weight) * 100
                         })
                         sectors_found += 1
-                print(f"[{ticker}] Tiingo API: Found {sectors_found} sector weightings")
+                logger.info(f"[{ticker}] Tiingo API: Found {sectors_found} sector weightings")
             else:
-                print(f"[{ticker}] Tiingo API: Empty or invalid metrics response")
+                logger.info(f"[{ticker}] Tiingo API: Empty or invalid metrics response")
         else:
-            print(f"[{ticker}] Tiingo metrics API: Failed - {response.text[:200]}")
+            logger.warning(f"[{ticker}] Tiingo metrics API: Failed - {response.text[:200]}")
     except Exception as e:
-        print(f"[{ticker}] Tiingo metrics API error: {e}")
+        logger.error(f"[{ticker}] Tiingo metrics API error: {e}")
 
     if result["topHoldings"] or result["sectorWeights"]:
-        print(f"[{ticker}] Tiingo API: SUCCESS - {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors")
+        logger.info(f"[{ticker}] Tiingo API: SUCCESS - {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors")
         return result
 
-    print(f"[{ticker}] Tiingo API: No data found")
+    logger.info(f"[{ticker}] Tiingo API: No data found")
     return None
 
 
@@ -291,15 +301,15 @@ def fetch_holdings_from_fmp(ticker):
     Fetch ETF holdings from Financial Modeling Prep API as a fallback.
     Requires FMP_API_KEY environment variable.
     """
-    print(f"[{ticker}] Fetching from Financial Modeling Prep API...")
+    logger.info(f"[{ticker}] Fetching from Financial Modeling Prep API...")
 
     if not FMP_API_KEY:
-        print(f"[{ticker}] FMP API: No API key configured (FMP_API_KEY not set)")
+        logger.warning(f"[{ticker}] FMP API: No API key configured (FMP_API_KEY not set)")
         return None
 
     # Strip exchange suffix for FMP (e.g., CNYAN.MX -> CNYAN)
     base_ticker = ticker.split('.')[0]
-    print(f"[{ticker}] FMP API: Using base ticker '{base_ticker}'")
+    logger.info(f"[{ticker}] FMP API: Using base ticker '{base_ticker}'")
 
     result = {
         "topHoldings": [],
@@ -310,11 +320,11 @@ def fetch_holdings_from_fmp(ticker):
     try:
         holdings_url = f"https://financialmodelingprep.com/api/v3/etf-holder/{base_ticker}?apikey={FMP_API_KEY}"
         response = requests.get(holdings_url, timeout=10)
-        print(f"[{ticker}] FMP holdings API: Status {response.status_code}")
+        logger.info(f"[{ticker}] FMP holdings API: Status {response.status_code}")
         if response.ok:
             holdings_data = response.json()
             if isinstance(holdings_data, list) and len(holdings_data) > 0:
-                print(f"[{ticker}] FMP API: Found {len(holdings_data)} holdings")
+                logger.info(f"[{ticker}] FMP API: Found {len(holdings_data)} holdings")
                 for holding in holdings_data[:20]:
                     weight = holding.get('weightPercentage', '')
                     if isinstance(weight, str):
@@ -327,17 +337,17 @@ def fetch_holdings_from_fmp(ticker):
                         "holdingPercent": weight
                     })
             else:
-                print(f"[{ticker}] FMP API: Empty or invalid holdings response - {str(holdings_data)[:200]}")
+                logger.info(f"[{ticker}] FMP API: Empty or invalid holdings response - {str(holdings_data)[:200]}")
         else:
-            print(f"[{ticker}] FMP holdings API: Failed - {response.text[:200]}")
+            logger.warning(f"[{ticker}] FMP holdings API: Failed - {response.text[:200]}")
     except Exception as e:
-        print(f"[{ticker}] FMP holdings API error: {e}")
+        logger.error(f"[{ticker}] FMP holdings API error: {e}")
 
     # Try to get sector weightings
     try:
         sector_url = f"https://financialmodelingprep.com/api/v3/etf-sector-weightings/{base_ticker}?apikey={FMP_API_KEY}"
         response = requests.get(sector_url, timeout=10)
-        print(f"[{ticker}] FMP sector API: Status {response.status_code}")
+        logger.info(f"[{ticker}] FMP sector API: Status {response.status_code}")
         if response.ok:
             sector_data = response.json()
             if isinstance(sector_data, list) and len(sector_data) > 0:
@@ -354,19 +364,19 @@ def fetch_holdings_from_fmp(ticker):
                             "weight": weight
                         })
                         sectors_found += 1
-                print(f"[{ticker}] FMP API: Found {sectors_found} sector weightings")
+                logger.info(f"[{ticker}] FMP API: Found {sectors_found} sector weightings")
             else:
-                print(f"[{ticker}] FMP API: Empty or invalid sector response - {str(sector_data)[:200]}")
+                logger.info(f"[{ticker}] FMP API: Empty or invalid sector response - {str(sector_data)[:200]}")
         else:
-            print(f"[{ticker}] FMP sector API: Failed - {response.text[:200]}")
+            logger.warning(f"[{ticker}] FMP sector API: Failed - {response.text[:200]}")
     except Exception as e:
-        print(f"[{ticker}] FMP sector API error: {e}")
+        logger.error(f"[{ticker}] FMP sector API error: {e}")
 
     if result["topHoldings"] or result["sectorWeights"]:
-        print(f"[{ticker}] FMP API: SUCCESS - {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors")
+        logger.info(f"[{ticker}] FMP API: SUCCESS - {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors")
         return result
 
-    print(f"[{ticker}] FMP API: No data found")
+    logger.info(f"[{ticker}] FMP API: No data found")
     return None
 
 
@@ -377,9 +387,9 @@ def get_holdings(ticker):
     Returns top holdings and sector breakdown for ETFs/Funds.
     Uses Yahoo Finance quoteSummary API directly for better coverage.
     """
-    print(f"\n{'='*60}")
-    print(f"[{ticker}] Starting holdings lookup...")
-    print(f"{'='*60}")
+    logger.info(f"{'='*60}")
+    logger.info(f"[{ticker}] Starting holdings lookup...")
+    logger.info(f"{'='*60}")
 
     try:
         ticker_obj = yf.Ticker(ticker)
@@ -387,10 +397,10 @@ def get_holdings(ticker):
         # Check if this is an ETF/Fund
         info = ticker_obj.info
         quote_type = info.get('quoteType', '')
-        print(f"[{ticker}] Quote type: {quote_type}")
+        logger.info(f"[{ticker}] Quote type: {quote_type}")
 
         if quote_type not in ['ETF', 'MUTUALFUND']:
-            print(f"[{ticker}] REJECTED: Not an ETF or Fund")
+            logger.warning(f"[{ticker}] REJECTED: Not an ETF or Fund")
             return jsonify({"error": f"Not an ETF or Fund (quoteType: {quote_type})"}), 400
 
         result = {
@@ -426,11 +436,11 @@ def get_holdings(ticker):
 
             if result["topHoldings"] or result["sectorWeights"]:
                 result["source"] = "yahoo"
-                print(f"[{ticker}] SUCCESS via Yahoo Finance API")
+                logger.info(f"[{ticker}] SUCCESS via Yahoo Finance API")
 
         # Fallback to yfinance funds_data if Yahoo API didn't return data
         if not result["topHoldings"] and not result["sectorWeights"]:
-            print(f"[{ticker}] Fetching from yfinance funds_data...")
+            logger.info(f"[{ticker}] Fetching from yfinance funds_data...")
             try:
                 funds_data = ticker_obj.funds_data
                 if funds_data:
@@ -438,7 +448,7 @@ def get_holdings(ticker):
                     try:
                         top_holdings = funds_data.top_holdings
                         if top_holdings is not None and hasattr(top_holdings, 'empty') and not top_holdings.empty:
-                            print(f"[{ticker}] yfinance: Found {len(top_holdings)} holdings")
+                            logger.info(f"[{ticker}] yfinance: Found {len(top_holdings)} holdings")
                             for idx, row in top_holdings.iterrows():
                                 result["topHoldings"].append({
                                     "symbol": str(idx) if idx else "",
@@ -446,15 +456,15 @@ def get_holdings(ticker):
                                     "holdingPercent": float(row.get('Holding Percent', row.get('holdingPercent', 0))) * 100
                                 })
                         else:
-                            print(f"[{ticker}] yfinance: No holdings data")
+                            logger.info(f"[{ticker}] yfinance: No holdings data")
                     except Exception as e:
-                        print(f"[{ticker}] yfinance holdings error: {e}")
+                        logger.error(f"[{ticker}] yfinance holdings error: {e}")
 
                     # Get sector weights from yfinance
                     try:
                         sector_weights = funds_data.sector_weightings
                         if sector_weights:
-                            print(f"[{ticker}] yfinance: Found sector weightings")
+                            logger.info(f"[{ticker}] yfinance: Found sector weightings")
                             if isinstance(sector_weights, list):
                                 for item in sector_weights:
                                     if isinstance(item, dict):
@@ -470,17 +480,17 @@ def get_holdings(ticker):
                                         "weight": float(weight) * 100
                                     })
                         else:
-                            print(f"[{ticker}] yfinance: No sector weightings")
+                            logger.info(f"[{ticker}] yfinance: No sector weightings")
                     except Exception as e:
-                        print(f"[{ticker}] yfinance sector error: {e}")
+                        logger.error(f"[{ticker}] yfinance sector error: {e}")
 
                     if result["topHoldings"] or result["sectorWeights"]:
                         result["source"] = "yfinance"
-                        print(f"[{ticker}] SUCCESS via yfinance")
+                        logger.info(f"[{ticker}] SUCCESS via yfinance")
                 else:
-                    print(f"[{ticker}] yfinance: No funds_data available")
+                    logger.info(f"[{ticker}] yfinance: No funds_data available")
             except Exception as e:
-                print(f"[{ticker}] yfinance funds_data error: {e}")
+                logger.error(f"[{ticker}] yfinance funds_data error: {e}")
 
         # Fallback to Tiingo API if still no data
         if not result["topHoldings"] and not result["sectorWeights"]:
@@ -489,7 +499,7 @@ def get_holdings(ticker):
                 result["topHoldings"] = tiingo_data.get("topHoldings", [])
                 result["sectorWeights"] = tiingo_data.get("sectorWeights", [])
                 result["source"] = "tiingo"
-                print(f"[{ticker}] SUCCESS via Tiingo API")
+                logger.info(f"[{ticker}] SUCCESS via Tiingo API")
 
         # Fallback to Financial Modeling Prep API if still no data
         if not result["topHoldings"] and not result["sectorWeights"]:
@@ -498,20 +508,20 @@ def get_holdings(ticker):
                 result["topHoldings"] = fmp_data.get("topHoldings", [])
                 result["sectorWeights"] = fmp_data.get("sectorWeights", [])
                 result["source"] = "fmp"
-                print(f"[{ticker}] SUCCESS via FMP API")
+                logger.info(f"[{ticker}] SUCCESS via FMP API")
 
         # Return error if no data available from any source
         if not result["topHoldings"] and not result["sectorWeights"]:
-            print(f"[{ticker}] FAILED: No data from any source")
-            print(f"{'='*60}\n")
+            logger.warning(f"[{ticker}] FAILED: No data from any source")
+            logger.info(f"{'='*60}")
             return jsonify({"error": "No holdings data available"}), 404
 
-        print(f"[{ticker}] Final result: {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors (source: {result.get('source', 'unknown')})")
-        print(f"{'='*60}\n")
+        logger.info(f"[{ticker}] Final result: {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors (source: {result.get('source', 'unknown')})")
+        logger.info(f"{'='*60}")
         return jsonify(result), 200
     except Exception as e:
-        print(f"[{ticker}] EXCEPTION: {e}")
-        print(f"{'='*60}\n")
+        logger.error(f"[{ticker}] EXCEPTION: {e}")
+        logger.info(f"{'='*60}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/stocks/close_prices', methods=['POST'])

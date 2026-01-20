@@ -1,6 +1,9 @@
 # Base image
 FROM python:3.11-slim
 
+# Force unbuffered output for Python (ensures logs appear immediately)
+ENV PYTHONUNBUFFERED=1
+
 # Set working directory
 WORKDIR /app
 

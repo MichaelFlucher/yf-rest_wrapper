@@ -8,8 +8,9 @@ import os
 
 app = Flask(__name__)
 
-# Tiingo API key from environment
+# API keys from environment
 TIINGO_API_KEY = os.environ.get('TIINGO_API_KEY')
+FMP_API_KEY = os.environ.get('FMP_API_KEY')
 
 pd.options.mode.use_inf_as_na = True
 
@@ -251,6 +252,71 @@ def fetch_holdings_from_tiingo(ticker):
     return None
 
 
+def fetch_holdings_from_fmp(ticker):
+    """
+    Fetch ETF holdings from Financial Modeling Prep API as a fallback.
+    Requires FMP_API_KEY environment variable.
+    """
+    if not FMP_API_KEY:
+        return None
+
+    # Strip exchange suffix for FMP (e.g., CNYAN.MX -> CNYAN)
+    base_ticker = ticker.split('.')[0]
+
+    result = {
+        "topHoldings": [],
+        "sectorWeights": []
+    }
+
+    # Try to get ETF holdings
+    try:
+        holdings_url = f"https://financialmodelingprep.com/api/v3/etf-holder/{base_ticker}?apikey={FMP_API_KEY}"
+        response = requests.get(holdings_url, timeout=10)
+        if response.ok:
+            holdings_data = response.json()
+            if isinstance(holdings_data, list):
+                for holding in holdings_data[:20]:  # Top 20 holdings
+                    weight = holding.get('weightPercentage', '')
+                    # FMP returns weight as string like "5.23%" or as number
+                    if isinstance(weight, str):
+                        weight = float(weight.replace('%', '')) if weight else 0
+                    else:
+                        weight = float(weight) if weight else 0
+                    result["topHoldings"].append({
+                        "symbol": holding.get('asset', ''),
+                        "holdingName": holding.get('name', ''),
+                        "holdingPercent": weight
+                    })
+    except Exception as e:
+        print(f"FMP holdings error: {e}")
+
+    # Try to get sector weightings
+    try:
+        sector_url = f"https://financialmodelingprep.com/api/v3/etf-sector-weightings/{base_ticker}?apikey={FMP_API_KEY}"
+        response = requests.get(sector_url, timeout=10)
+        if response.ok:
+            sector_data = response.json()
+            if isinstance(sector_data, list):
+                for sector_item in sector_data:
+                    weight = sector_item.get('weightPercentage', '')
+                    # FMP returns weight as string like "5.23%" or as number
+                    if isinstance(weight, str):
+                        weight = float(weight.replace('%', '')) if weight else 0
+                    else:
+                        weight = float(weight) if weight else 0
+                    if weight > 0:
+                        result["sectorWeights"].append({
+                            "sector": sector_item.get('sector', ''),
+                            "weight": weight
+                        })
+    except Exception as e:
+        print(f"FMP sector error: {e}")
+
+    if result["topHoldings"] or result["sectorWeights"]:
+        return result
+    return None
+
+
 @app.route('/stock/<ticker>/holdings', methods=['GET'])
 def get_holdings(ticker):
     """
@@ -346,6 +412,14 @@ def get_holdings(ticker):
                 result["topHoldings"] = tiingo_data.get("topHoldings", [])
                 result["sectorWeights"] = tiingo_data.get("sectorWeights", [])
                 result["source"] = "tiingo"
+
+        # Fallback to Financial Modeling Prep API if still no data
+        if not result["topHoldings"] and not result["sectorWeights"]:
+            fmp_data = fetch_holdings_from_fmp(ticker)
+            if fmp_data:
+                result["topHoldings"] = fmp_data.get("topHoldings", [])
+                result["sectorWeights"] = fmp_data.get("sectorWeights", [])
+                result["source"] = "fmp"
 
         # Return error if no data available from any source
         if not result["topHoldings"] and not result["sectorWeights"]:

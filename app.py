@@ -22,7 +22,8 @@ app = Flask(__name__)
 TIINGO_API_KEY = os.environ.get('TIINGO_API_KEY')
 FMP_API_KEY = os.environ.get('FMP_API_KEY')
 
-pd.options.mode.use_inf_as_na = True
+# Note: pd.options.mode.use_inf_as_na was removed in pandas 2.1.0
+# Inf values are now handled in clean_json() function instead
 
 def clean_json(df):
     # Replace literal strings "NaN" or "nan" with actual np.nan

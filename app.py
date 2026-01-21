@@ -743,7 +743,10 @@ def get_close_prices_range():
         except ValueError:
             return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
 
-        df = yf.download(tickers, start=start, end=end, auto_adjust=False)["Close"]
+        # yfinance end date is exclusive, so add 1 day to include the end date
+        end_inclusive = end + timedelta(days=1)
+
+        df = yf.download(tickers, start=start, end=end_inclusive, auto_adjust=False)["Close"]
         if df.empty:
             return jsonify({"error": "No data available for the given parameters"}), 404
 

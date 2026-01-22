@@ -35,6 +35,101 @@ def clean_json(df):
     # Reset index and return a list of records
     return df.reset_index().to_dict(orient='records')
 
+
+def enrich_holdings_with_country(holdings, etf_ticker):
+    """
+    Enriches ETF holdings with country information for each holding.
+    Looks up each holding's ticker to get its country.
+
+    Args:
+        holdings: List of holding dicts with 'symbol' key
+        etf_ticker: The ETF ticker (for logging)
+
+    Returns:
+        The same holdings list with 'country' field added to each holding
+    """
+    if not holdings:
+        return holdings
+
+    symbols = [h.get('symbol', '') for h in holdings if h.get('symbol')]
+    if not symbols:
+        return holdings
+
+    logger.info(f"[{etf_ticker}] Enriching {len(symbols)} holdings with country data...")
+
+    # Create a map of symbol -> country
+    country_map = {}
+
+    for symbol in symbols:
+        if not symbol:
+            continue
+        try:
+            ticker_obj = yf.Ticker(symbol)
+            info = ticker_obj.info
+            country = info.get('country', '')
+            if country:
+                country_map[symbol] = country
+                logger.info(f"[{etf_ticker}]   {symbol} -> {country}")
+            else:
+                # Try to infer country from exchange
+                exchange = info.get('exchange', '')
+                country_map[symbol] = infer_country_from_exchange(exchange)
+                logger.info(f"[{etf_ticker}]   {symbol} -> {country_map[symbol]} (inferred from {exchange})")
+        except Exception as e:
+            logger.warning(f"[{etf_ticker}]   {symbol} -> failed to get country: {e}")
+            country_map[symbol] = ''
+
+    # Add country to each holding
+    for holding in holdings:
+        symbol = holding.get('symbol', '')
+        holding['country'] = country_map.get(symbol, '')
+
+    logger.info(f"[{etf_ticker}] Country enrichment complete")
+    return holdings
+
+
+def infer_country_from_exchange(exchange):
+    """
+    Infers country from exchange code when direct country info is not available.
+    """
+    exchange_country_map = {
+        'NYQ': 'United States',
+        'NMS': 'United States',
+        'NGM': 'United States',
+        'PCX': 'United States',
+        'BTS': 'United States',
+        'NYS': 'United States',
+        'NAS': 'United States',
+        'LSE': 'United Kingdom',
+        'GER': 'Germany',
+        'FRA': 'Germany',
+        'STU': 'Germany',
+        'DUS': 'Germany',
+        'MUN': 'Germany',
+        'HAM': 'Germany',
+        'BER': 'Germany',
+        'PAR': 'France',
+        'AMS': 'Netherlands',
+        'BRU': 'Belgium',
+        'LIS': 'Portugal',
+        'MIL': 'Italy',
+        'MCE': 'Spain',
+        'SWX': 'Switzerland',
+        'VIE': 'Austria',
+        'HKG': 'Hong Kong',
+        'TYO': 'Japan',
+        'SHH': 'China',
+        'SHZ': 'China',
+        'TSE': 'Canada',
+        'ASX': 'Australia',
+        'KSC': 'South Korea',
+        'KOE': 'South Korea',
+        'TAI': 'Taiwan',
+        'NSE': 'India',
+        'BSE': 'India',
+    }
+    return exchange_country_map.get(exchange, '')
+
 # Route for searching symbols by ISIN or query
 @app.route('/search', methods=['GET'])
 def search_symbol():
@@ -689,6 +784,10 @@ def get_holdings(ticker):
             logger.warning(f"[{ticker}] FAILED: No data from any source")
             logger.info(f"{'='*60}")
             return jsonify({"error": "No holdings data available"}), 404
+
+        # Enrich holdings with country data
+        if result["topHoldings"]:
+            result["topHoldings"] = enrich_holdings_with_country(result["topHoldings"], ticker)
 
         logger.info(f"[{ticker}] Final result: {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors (source: {result.get('source', 'unknown')})")
         logger.info(f"{'='*60}")

@@ -7,6 +7,9 @@ import requests
 import os
 import logging
 import sys
+import hashlib
+from cachetools import TTLCache
+from threading import Lock
 
 # Configure logging to flush immediately and show in Docker logs
 logging.basicConfig(
@@ -21,6 +24,18 @@ app = Flask(__name__)
 # API keys from environment
 TIINGO_API_KEY = os.environ.get('TIINGO_API_KEY')
 FMP_API_KEY = os.environ.get('FMP_API_KEY')
+
+# Cache configuration
+# TTLCache(maxsize, ttl_in_seconds)
+search_cache = TTLCache(maxsize=500, ttl=86400)  # 24 hours for ISIN searches
+ticker_info_cache = TTLCache(maxsize=200, ttl=3600)  # 1 hour for ticker info
+holdings_cache = TTLCache(maxsize=100, ttl=21600)  # 6 hours for ETF holdings
+cache_lock = Lock()
+
+def get_cache_key(*args):
+    """Generate a cache key from arguments."""
+    key_str = ":".join(str(arg) for arg in args)
+    return hashlib.md5(key_str.encode()).hexdigest()
 
 # Note: pd.options.mode.use_inf_as_na was removed in pandas 2.1.0
 # Inf values are now handled in clean_json() function instead
@@ -140,6 +155,15 @@ def search_symbol():
         if not query:
             return jsonify({"error": "Missing query parameter 'q'"}), 400
 
+        # Check cache first
+        cache_key = get_cache_key('search', query, region)
+        with cache_lock:
+            if cache_key in search_cache:
+                logger.info(f"[search] Cache HIT for query '{query}'")
+                return jsonify(search_cache[cache_key]), 200
+
+        logger.info(f"[search] Cache MISS for query '{query}', fetching from Yahoo...")
+
         # Build Yahoo Finance search URL
         yahoo_url = f"https://query2.finance.yahoo.com/v1/finance/search"
         params = {
@@ -164,7 +188,13 @@ def search_symbol():
                 "details": response.text[:200]
             }), response.status_code
 
-        return jsonify(response.json()), 200
+        result = response.json()
+
+        # Cache the successful result
+        with cache_lock:
+            search_cache[cache_key] = result
+
+        return jsonify(result), 200
 
     except requests.exceptions.Timeout:
         return jsonify({"error": "Request to Yahoo Finance timed out"}), 504
@@ -177,8 +207,23 @@ def search_symbol():
 @app.route('/stock/<ticker>', methods=['GET'])
 def get_ticker_info(ticker):
     try:
+        # Check cache first
+        cache_key = get_cache_key('ticker_info', ticker)
+        with cache_lock:
+            if cache_key in ticker_info_cache:
+                logger.info(f"[{ticker}] Ticker info cache HIT")
+                return jsonify(ticker_info_cache[cache_key]), 200
+
+        logger.info(f"[{ticker}] Ticker info cache MISS, fetching from Yahoo...")
+
         ticker_obj = yf.Ticker(ticker)
-        return jsonify(ticker_obj.info), 200
+        info = ticker_obj.info
+
+        # Cache the result
+        with cache_lock:
+            ticker_info_cache[cache_key] = info
+
+        return jsonify(info), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -573,8 +618,15 @@ def get_holdings(ticker):
     # Get optional ISIN from query params (avoids lookup if provided by caller)
     provided_isin = request.args.get('isin')
 
+    # Check cache first
+    cache_key = get_cache_key('holdings', ticker, provided_isin or '')
+    with cache_lock:
+        if cache_key in holdings_cache:
+            logger.info(f"[{ticker}] Holdings cache HIT")
+            return jsonify(holdings_cache[cache_key]), 200
+
     logger.info(f"{'='*60}")
-    logger.info(f"[{ticker}] Starting holdings lookup...")
+    logger.info(f"[{ticker}] Holdings cache MISS, starting lookup...")
     if provided_isin:
         logger.info(f"[{ticker}] ISIN provided by caller: {provided_isin}")
     logger.info(f"{'='*60}")
@@ -789,6 +841,10 @@ def get_holdings(ticker):
         if result["topHoldings"]:
             result["topHoldings"] = enrich_holdings_with_country(result["topHoldings"], ticker)
 
+        # Cache the successful result
+        with cache_lock:
+            holdings_cache[cache_key] = result
+
         logger.info(f"[{ticker}] Final result: {len(result['topHoldings'])} holdings, {len(result['sectorWeights'])} sectors (source: {result.get('source', 'unknown')})")
         logger.info(f"{'='*60}")
         return jsonify(result), 200
@@ -862,6 +918,40 @@ def get_close_prices_range():
         return jsonify(response), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/cache/stats', methods=['GET'])
+def get_cache_stats():
+    """Get current cache statistics."""
+    with cache_lock:
+        return jsonify({
+            "search_cache": {
+                "size": len(search_cache),
+                "maxsize": search_cache.maxsize,
+                "ttl_seconds": 86400
+            },
+            "ticker_info_cache": {
+                "size": len(ticker_info_cache),
+                "maxsize": ticker_info_cache.maxsize,
+                "ttl_seconds": 3600
+            },
+            "holdings_cache": {
+                "size": len(holdings_cache),
+                "maxsize": holdings_cache.maxsize,
+                "ttl_seconds": 21600
+            }
+        }), 200
+
+
+@app.route('/cache/clear', methods=['POST'])
+def clear_cache():
+    """Clear all caches."""
+    with cache_lock:
+        search_cache.clear()
+        ticker_info_cache.clear()
+        holdings_cache.clear()
+    logger.info("All caches cleared")
+    return jsonify({"message": "All caches cleared"}), 200
 
 
 if __name__ == '__main__':

@@ -10,6 +10,8 @@ import sys
 import hashlib
 from cachetools import TTLCache
 from threading import Lock
+import psycopg2
+from psycopg2.extras import execute_values
 
 # Configure logging to flush immediately and show in Docker logs
 logging.basicConfig(
@@ -24,6 +26,148 @@ app = Flask(__name__)
 # API keys from environment
 TIINGO_API_KEY = os.environ.get('TIINGO_API_KEY')
 FMP_API_KEY = os.environ.get('FMP_API_KEY')
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# Database connection pool
+db_connection = None
+
+def get_db_connection():
+    """Get or create database connection."""
+    global db_connection
+    if not DATABASE_URL:
+        return None
+
+    try:
+        if db_connection is None or db_connection.closed:
+            db_connection = psycopg2.connect(DATABASE_URL)
+            db_connection.autocommit = True
+            logger.info("Database connection established")
+        return db_connection
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        return None
+
+def init_db():
+    """Initialize database table if it doesn't exist."""
+    if not DATABASE_URL:
+        logger.info("DATABASE_URL not set, price history caching disabled")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS price_history_cache (
+                    id SERIAL PRIMARY KEY,
+                    ticker VARCHAR(20) NOT NULL,
+                    date DATE NOT NULL,
+                    open DECIMAL(16, 6),
+                    high DECIMAL(16, 6),
+                    low DECIMAL(16, 6),
+                    close DECIMAL(16, 6),
+                    volume BIGINT,
+                    created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+                    UNIQUE(ticker, date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_price_history_ticker ON price_history_cache(ticker);
+                CREATE INDEX IF NOT EXISTS idx_price_history_date ON price_history_cache(date);
+                CREATE INDEX IF NOT EXISTS idx_price_history_ticker_date ON price_history_cache(ticker, date);
+            """)
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+
+def get_cached_prices(tickers, start_date, end_date):
+    """
+    Get cached prices from database.
+    Returns dict: {ticker: {date_str: close_price}}
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {}
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ticker, date, close
+                FROM price_history_cache
+                WHERE ticker = ANY(%s)
+                AND date >= %s AND date <= %s
+                ORDER BY ticker, date
+            """, (tickers, start_date, end_date))
+
+            results = {}
+            for ticker, date, close in cur.fetchall():
+                if ticker not in results:
+                    results[ticker] = {}
+                results[ticker][date.strftime('%Y-%m-%d')] = float(close) if close else None
+
+            return results
+    except Exception as e:
+        logger.error(f"Error fetching cached prices: {e}")
+        return {}
+
+def store_prices_in_cache(ticker, prices_df):
+    """
+    Store prices in database cache.
+    prices_df should have DatetimeIndex and columns: Open, High, Low, Close, Volume
+    """
+    conn = get_db_connection()
+    if not conn or prices_df.empty:
+        return
+
+    try:
+        # Prepare data for batch insert
+        data = []
+        for date_idx, row in prices_df.iterrows():
+            date_str = date_idx.strftime('%Y-%m-%d')
+            data.append((
+                ticker,
+                date_str,
+                float(row.get('Open')) if pd.notna(row.get('Open')) else None,
+                float(row.get('High')) if pd.notna(row.get('High')) else None,
+                float(row.get('Low')) if pd.notna(row.get('Low')) else None,
+                float(row.get('Close')) if pd.notna(row.get('Close')) else None,
+                int(row.get('Volume')) if pd.notna(row.get('Volume')) else None,
+            ))
+
+        if not data:
+            return
+
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO price_history_cache (ticker, date, open, high, low, close, volume)
+                VALUES %s
+                ON CONFLICT (ticker, date) DO NOTHING
+                """,
+                data
+            )
+
+        logger.info(f"[{ticker}] Cached {len(data)} price records")
+    except Exception as e:
+        logger.error(f"Error storing prices in cache: {e}")
+
+def get_cached_dates_for_ticker(ticker, start_date, end_date):
+    """Get set of dates that are already cached for a ticker."""
+    conn = get_db_connection()
+    if not conn:
+        return set()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT date FROM price_history_cache
+                WHERE ticker = %s AND date >= %s AND date <= %s
+            """, (ticker, start_date, end_date))
+            return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"Error getting cached dates: {e}")
+        return set()
 
 # Cache configuration
 # TTLCache(maxsize, ttl_in_seconds)
@@ -898,49 +1042,224 @@ def get_close_prices_range():
         except ValueError:
             return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
 
-        # yfinance end date is exclusive, so add 1 day to include the end date
+        # Check if database caching is available
+        if DATABASE_URL:
+            return get_close_prices_range_with_cache(tickers, start, end)
+        else:
+            return get_close_prices_range_from_yahoo(tickers, start, end)
+
+    except Exception as e:
+        logger.error(f"Error in get_close_prices_range: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def get_close_prices_range_from_yahoo(tickers, start, end):
+    """Fetch prices directly from Yahoo Finance (no caching)."""
+    # yfinance end date is exclusive, so add 1 day to include the end date
+    end_inclusive = end + timedelta(days=1)
+
+    df = yf.download(tickers, start=start, end=end_inclusive, auto_adjust=False)["Close"]
+    if df.empty:
+        return jsonify({"error": "No data available for the given parameters"}), 404
+
+    # Handle single ticker case (returns Series instead of DataFrame)
+    if isinstance(df, pd.Series):
+        df = df.to_frame(name=tickers[0])
+
+    # Ensure all tickers are in the DataFrame (even if missing)
+    for ticker in tickers:
+        if ticker not in df.columns:
+            df[ticker] = float('nan')
+
+    response = {
+        "dates": df.index.strftime('%Y-%m-%d').tolist(),
+        "prices": {ticker: [None if pd.isna(v) else v for v in df[ticker].tolist()] for ticker in tickers}
+    }
+
+    return jsonify(response), 200
+
+
+def get_close_prices_range_with_cache(tickers, start, end):
+    """Fetch prices with database caching for historical data."""
+    today = datetime.today().date()
+    start_date = start.date() if isinstance(start, datetime) else start
+    end_date = end.date() if isinstance(end, datetime) else end
+
+    # Don't cache today's or future prices (they may still change)
+    cache_cutoff = today - timedelta(days=1)
+
+    # Get cached data from database
+    cached_data = get_cached_prices(tickers, start_date, min(end_date, cache_cutoff))
+
+    # Determine which tickers need fetching and for what date range
+    tickers_to_fetch = []
+    fetch_start = start_date
+    fetch_end = end_date
+
+    for ticker in tickers:
+        cached_dates = set(cached_data.get(ticker, {}).keys())
+        if ticker not in cached_data or len(cached_dates) == 0:
+            # No cached data, need to fetch everything
+            tickers_to_fetch.append(ticker)
+        else:
+            # Check if we have gaps in the cached data
+            # For simplicity, if any dates are missing in the cacheable range, refetch for that ticker
+            tickers_to_fetch.append(ticker)
+
+    # Fetch from Yahoo Finance
+    all_prices = {}
+    all_dates = set()
+
+    if tickers_to_fetch:
+        logger.info(f"Fetching prices from Yahoo for {len(tickers_to_fetch)} tickers: {start_date} to {end_date}")
+
+        # yfinance end date is exclusive, so add 1 day
         end_inclusive = end + timedelta(days=1)
 
-        df = yf.download(tickers, start=start, end=end_inclusive, auto_adjust=False)["Close"]
-        if df.empty:
-            return jsonify({"error": "No data available for the given parameters"}), 404
+        try:
+            # Download with all OHLCV data for caching
+            df_full = yf.download(tickers_to_fetch, start=start, end=end_inclusive, auto_adjust=False)
 
-        # Ensure all tickers are in the DataFrame (even if missing)
-        for ticker in tickers:
-            if ticker not in df.columns:
-                df[ticker] = float('nan')
+            if not df_full.empty:
+                # Handle single vs multiple ticker case
+                is_single_ticker = len(tickers_to_fetch) == 1
 
-        response = {
-            "dates": df.index.strftime('%Y-%m-%d').tolist(),
-            "prices": {ticker: [None if pd.isna(v) else v for v in df[ticker].tolist()] for ticker in tickers}
-        }
+                if is_single_ticker:
+                    ticker = tickers_to_fetch[0]
+                    # Single ticker: df_full has simple column names (Open, High, Low, Close, Volume)
+                    df_close = df_full["Close"]
+                    if isinstance(df_close, pd.Series):
+                        df_close = df_close.to_frame(name=ticker)
 
-        return jsonify(response), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+                    # Cache historical data (exclude today and future)
+                    cacheable_data = df_full[df_full.index.date < today]
+                    if not cacheable_data.empty:
+                        store_prices_in_cache(ticker, cacheable_data)
+
+                    # Add to response
+                    for date_idx, price in df_close[ticker].items():
+                        date_str = date_idx.strftime('%Y-%m-%d')
+                        all_dates.add(date_str)
+                        if ticker not in all_prices:
+                            all_prices[ticker] = {}
+                        all_prices[ticker][date_str] = None if pd.isna(price) else float(price)
+                else:
+                    # Multiple tickers: df_full has MultiIndex columns (metric, ticker)
+                    df_close = df_full["Close"]
+
+                    for ticker in tickers_to_fetch:
+                        if ticker in df_close.columns:
+                            # Extract OHLCV data for this ticker
+                            ticker_data = pd.DataFrame({
+                                'Open': df_full['Open'][ticker] if 'Open' in df_full.columns.get_level_values(0) else None,
+                                'High': df_full['High'][ticker] if 'High' in df_full.columns.get_level_values(0) else None,
+                                'Low': df_full['Low'][ticker] if 'Low' in df_full.columns.get_level_values(0) else None,
+                                'Close': df_full['Close'][ticker] if 'Close' in df_full.columns.get_level_values(0) else None,
+                                'Volume': df_full['Volume'][ticker] if 'Volume' in df_full.columns.get_level_values(0) else None,
+                            }, index=df_full.index)
+
+                            # Cache historical data (exclude today and future)
+                            cacheable_data = ticker_data[ticker_data.index.date < today]
+                            if not cacheable_data.empty:
+                                store_prices_in_cache(ticker, cacheable_data)
+
+                            # Add to response
+                            for date_idx, price in df_close[ticker].items():
+                                date_str = date_idx.strftime('%Y-%m-%d')
+                                all_dates.add(date_str)
+                                if ticker not in all_prices:
+                                    all_prices[ticker] = {}
+                                all_prices[ticker][date_str] = None if pd.isna(price) else float(price)
+
+        except Exception as e:
+            logger.error(f"Error fetching from Yahoo: {e}")
+            # Fall back to cached data only
+            pass
+
+    # Merge cached data with freshly fetched data
+    for ticker in tickers:
+        if ticker in cached_data:
+            if ticker not in all_prices:
+                all_prices[ticker] = {}
+            # Cached data takes precedence for historical dates (it's verified)
+            for date_str, price in cached_data[ticker].items():
+                if date_str not in all_prices[ticker]:
+                    all_prices[ticker][date_str] = price
+                    all_dates.add(date_str)
+
+    if not all_dates:
+        return jsonify({"error": "No data available for the given parameters"}), 404
+
+    # Sort dates and build response
+    sorted_dates = sorted(all_dates)
+
+    response = {
+        "dates": sorted_dates,
+        "prices": {}
+    }
+
+    for ticker in tickers:
+        ticker_prices = all_prices.get(ticker, {})
+        response["prices"][ticker] = [ticker_prices.get(d) for d in sorted_dates]
+
+    # Log cache stats
+    cached_count = sum(1 for t in tickers if t in cached_data and cached_data[t])
+    logger.info(f"Price request: {len(tickers)} tickers, {len(sorted_dates)} dates, {cached_count} from cache")
+
+    return jsonify(response), 200
 
 
 @app.route('/cache/stats', methods=['GET'])
 def get_cache_stats():
     """Get current cache statistics."""
+    stats = {
+        "search_cache": {
+            "size": len(search_cache),
+            "maxsize": search_cache.maxsize,
+            "ttl_seconds": 86400
+        },
+        "ticker_info_cache": {
+            "size": len(ticker_info_cache),
+            "maxsize": ticker_info_cache.maxsize,
+            "ttl_seconds": 3600
+        },
+        "holdings_cache": {
+            "size": len(holdings_cache),
+            "maxsize": holdings_cache.maxsize,
+            "ttl_seconds": 21600
+        }
+    }
+
+    # Add database cache stats if available
+    if DATABASE_URL:
+        conn = get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            COUNT(*) as total_records,
+                            COUNT(DISTINCT ticker) as unique_tickers,
+                            MIN(date) as earliest_date,
+                            MAX(date) as latest_date
+                        FROM price_history_cache
+                    """)
+                    row = cur.fetchone()
+                    stats["price_history_cache"] = {
+                        "total_records": row[0],
+                        "unique_tickers": row[1],
+                        "earliest_date": row[2].strftime('%Y-%m-%d') if row[2] else None,
+                        "latest_date": row[3].strftime('%Y-%m-%d') if row[3] else None,
+                        "storage": "postgresql",
+                        "ttl": "permanent (historical data)"
+                    }
+            except Exception as e:
+                stats["price_history_cache"] = {"error": str(e)}
+    else:
+        stats["price_history_cache"] = {"status": "disabled", "reason": "DATABASE_URL not set"}
+
     with cache_lock:
-        return jsonify({
-            "search_cache": {
-                "size": len(search_cache),
-                "maxsize": search_cache.maxsize,
-                "ttl_seconds": 86400
-            },
-            "ticker_info_cache": {
-                "size": len(ticker_info_cache),
-                "maxsize": ticker_info_cache.maxsize,
-                "ttl_seconds": 3600
-            },
-            "holdings_cache": {
-                "size": len(holdings_cache),
-                "maxsize": holdings_cache.maxsize,
-                "ttl_seconds": 21600
-            }
-        }), 200
+        return jsonify(stats), 200
 
 
 @app.route('/cache/clear', methods=['POST'])
@@ -955,4 +1274,9 @@ def clear_cache():
 
 
 if __name__ == '__main__':
+    # Initialize database for price history caching
+    init_db()
     app.run(debug=True, host='0.0.0.0', port=5000)
+else:
+    # Also init when running with gunicorn or other WSGI servers
+    init_db()

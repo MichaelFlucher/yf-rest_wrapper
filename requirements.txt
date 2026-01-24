@@ -2,3 +2,4 @@ flask
 yfinance
 requests
 cachetools
+psycopg2-binary
